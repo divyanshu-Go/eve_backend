@@ -6,6 +6,8 @@ import Booking from "@/models/Booking";
 import Payment from "@/models/Payment";
 import { authenticateRequest } from "@/lib/auth";
 
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export async function POST(request) {
   try {
     const decoded = authenticateRequest(request);
@@ -69,7 +71,7 @@ export async function POST(request) {
       );
     }
 
-    // Prevent multiple payments for the same pending booking.
+    // Payment should only be created by the webhook.
     const existingPayment = await Payment.findOne({
       booking: booking._id,
     });
@@ -79,54 +81,66 @@ export async function POST(request) {
         {
           success: false,
           message: "Payment already exists for this booking",
-          payment: existingPayment,
         },
         { status: 409 }
       );
     }
 
-    /*
-     * IMPORTANT:
-     * Never use an amount supplied by the client.
-     * The booking amount is the source of truth.
-     */
-    const amount = booking.amount;
+    // Simulate payment gateway processing time.
+    await wait(2000);
 
+    // Simulate the payment provider generating these values.
     const transactionId = `txn_${crypto.randomUUID()}`;
+    const eventId = `evt_${crypto.randomUUID()}`;
 
-    const payment = await Payment.create({
-      booking: booking._id,
-      amount,
-      status: paymentStatus,
-      transactionId,
+    // Our payment simulator calls our webhook.
+    const webhookUrl = new URL(
+      "/api/payments/webhook",
+      request.url
+    );
+
+    const webhookResponse = await fetch(webhookUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        eventId,
+        bookingId: booking._id.toString(),
+        transactionId,
+        paymentStatus,
+      }),
     });
 
-    if (paymentStatus === "SUCCESS") {
-      booking.status = "CONFIRMED";
-    } else {
-      booking.status = "FAILED";
+    const webhookResult = await webhookResponse.json();
+
+    if (!webhookResponse.ok) {
+      return Response.json(
+        {
+          success: false,
+          message: "Payment simulation failed",
+          details: webhookResult,
+        },
+        { status: 500 }
+      );
     }
 
-    await booking.save();
-
-    return Response.json(
-      {
-        success: true,
-        message: "Payment processed successfully",
-        payment,
-        booking,
-      },
-      { status: 201 }
-    );
+    return Response.json({
+      success: true,
+      message: "Payment simulation completed",
+      transactionId,
+      paymentStatus,
+      webhook: webhookResult,
+    });
   } catch (error) {
-    console.error("Payment error:", error);
+    console.error("Payment simulation error:", error);
 
     return Response.json(
       {
         success: false,
-        message: error.message,
+        message: error.message || "Something went wrong",
       },
-      { status: 401 }
+      { status: 500 }
     );
   }
 }

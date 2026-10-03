@@ -6,25 +6,38 @@ import Booking from "@/models/Booking";
 import WebhookEvent from "@/models/WebhookEvent";
 
 export async function POST(request) {
-  try {
-    const { eventId, transactionId, status } = await request.json();
+  const session = await mongoose.startSession();
 
-    // Basic validation
-    if (!eventId || !transactionId || !status) {
+  try {
+    const { eventId, bookingId, transactionId, paymentStatus } =
+      await request.json();
+
+    if (!eventId || !bookingId || !transactionId || !paymentStatus) {
       return Response.json(
         {
           success: false,
-          message: "eventId, transactionId and status are required",
+          message:
+            "eventId, bookingId, transactionId and paymentStatus are required",
         },
         { status: 400 }
       );
     }
 
-    if (!["SUCCESS", "FAILED"].includes(status)) {
+    if (!mongoose.Types.ObjectId.isValid(bookingId)) {
       return Response.json(
         {
           success: false,
-          message: "Status must be SUCCESS or FAILED",
+          message: "Invalid booking ID",
+        },
+        { status: 400 }
+      );
+    }
+
+    if (!["SUCCESS", "FAILED"].includes(paymentStatus)) {
+      return Response.json(
+        {
+          success: false,
+          message: "Payment status must be SUCCESS or FAILED",
         },
         { status: 400 }
       );
@@ -32,93 +45,117 @@ export async function POST(request) {
 
     await connectDB();
 
-    // Check idempotency
-    const existingEvent = await WebhookEvent.findOne({ eventId });
+    let result;
 
-    if (existingEvent) {
-      return Response.json({
+    await session.withTransaction(async () => {
+      // Idempotency check
+      const existingEvent = await WebhookEvent.findOne({
+        eventId,
+      }).session(session);
+
+      if (existingEvent) {
+        result = {
+          success: true,
+          message: "Webhook already processed",
+          duplicate: true,
+        };
+
+        return;
+      }
+
+      // Find booking
+      const booking = await Booking.findById(bookingId).session(session);
+
+      if (!booking) {
+        throw new Error("Booking not found");
+      }
+
+      // Check whether a payment already exists
+      const existingPayment = await Payment.findOne({
+        booking: booking._id,
+      }).session(session);
+
+      if (existingPayment) {
+        // Same payment arriving with different information
+        if (
+          existingPayment.transactionId !== transactionId ||
+          existingPayment.status !== paymentStatus
+        ) {
+          throw new Error("Payment already exists with different details");
+        }
+
+        await WebhookEvent.create(
+          [
+            {
+              eventId,
+              payment: existingPayment._id,
+              status: paymentStatus,
+            },
+          ],
+          { session }
+        );
+
+        result = {
+          success: true,
+          message: "Payment already exists",
+          duplicate: false,
+        };
+
+        return;
+      }
+
+      // Payment amount always comes from the booking.
+      const payment = await Payment.create(
+        [
+          {
+            booking: booking._id,
+            amount: booking.amount,
+            status: paymentStatus,
+            transactionId,
+          },
+        ],
+        { session }
+      );
+
+      // Update booking based on payment result.
+      booking.status =
+        paymentStatus === "SUCCESS" ? "CONFIRMED" : "FAILED";
+
+      await booking.save({ session });
+
+      // Store event for idempotency.
+      await WebhookEvent.create(
+        [
+          {
+            eventId,
+            payment: payment[0]._id,
+            status: paymentStatus,
+          },
+        ],
+        { session }
+      );
+
+      result = {
         success: true,
-        message: "Webhook already processed",
-        duplicate: true,
-      });
-    }
-
-    // Find payment using transaction ID
-    const payment = await Payment.findOne({ transactionId });
-
-    if (!payment) {
-      return Response.json(
-        {
-          success: false,
-          message: "Payment not found",
-        },
-        { status: 404 }
-      );
-    }
-
-    // Find associated booking
-    const booking = await Booking.findById(payment.booking);
-
-    if (!booking) {
-      return Response.json(
-        {
-          success: false,
-          message: "Associated booking not found",
-        },
-        { status: 404 }
-      );
-    }
-
-    // Payment already has a different final status
-    if (payment.status !== status) {
-      return Response.json(
-        {
-          success: false,
-          message: "Payment status conflict",
-        },
-        { status: 409 }
-      );
-    }
-
-    // Make sure booking status matches payment status
-    const expectedBookingStatus =
-      status === "SUCCESS" ? "CONFIRMED" : "FAILED";
-
-    if (booking.status !== expectedBookingStatus) {
-      booking.status = expectedBookingStatus;
-      await booking.save();
-    }
-
-    // Store webhook event
-    await WebhookEvent.create({
-      eventId,
-      payment: payment._id,
-      status,
+        message: "Webhook processed successfully",
+        duplicate: false,
+        paymentId: payment[0]._id,
+        bookingStatus: booking.status,
+      };
     });
 
-    return Response.json({
-      success: true,
-      message: "Webhook processed successfully",
-      duplicate: false,
-    });
+    return Response.json(result);
   } catch (error) {
     console.error("Webhook error:", error);
-
-    // Handle duplicate event race condition
-    if (error.code === 11000) {
-      return Response.json({
-        success: true,
-        message: "Webhook already processed",
-        duplicate: true,
-      });
-    }
 
     return Response.json(
       {
         success: false,
-        message: "Internal server error",
+        message: error.message || "Internal server error",
       },
       { status: 500 }
     );
+  } finally {
+    await session.endSession();
   }
 }
